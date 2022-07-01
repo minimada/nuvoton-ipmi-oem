@@ -1,5 +1,6 @@
 #pragma once
 #include <ipmid/api.hpp>
+#include <optional>
 
 namespace ipmi
 {
@@ -45,6 +46,11 @@ int getPsuVersionInfo(ipmi::Context::ptr& ctx, std::string& ver);
 void startflashPsu(sdbusplus::bus::bus& bus);
 void subscribeToSystemdSignals(sdbusplus::bus::bus& bus);
 void unsubscribeFromSystemdSignals(sdbusplus::bus::bus& bus);
+ipmi::RspType<uint8_t> ipmiOemPsuFwUpdate(uint8_t region, uint8_t action,
+                                          std::string image);
+ipmi::RspType<std::vector<uint8_t>>
+    masterPhase(uint8_t bus_id, uint8_t address, uint8_t phase,
+                uint8_t read_count, std::optional<std::vector<uint8_t>> data);
 } // namespace psu
 
 namespace cpld

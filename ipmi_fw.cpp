@@ -8,7 +8,6 @@
 #include <iostream>
 #include <ipmid/api.hpp>
 #include <nlohmann/json.hpp>
-#include <optional>
 #include <phosphor-logging/elog-errors.hpp>
 #include <phosphor-logging/log.hpp>
 #include <stdexcept>
@@ -102,67 +101,6 @@ int readFwConfig(std::string target, FW_CONFIG& fw_config)
     return 0;
 }
 
-// TBD: wait for implement
-ipmi::RspType<> psuFwUpdate(std::string image)
-{
-    std::string msg = "psuFwUpdate: " + image;
-    log<level::INFO>(msg.c_str());
-    return ipmi::responseCmdFailFwUpdMode();
-}
-
-// TBD: wait for implement
-ipmi::RspType<> psuFwStatus(uint8_t region)
-{
-    log<level::INFO>("psuFwStatus");
-    return ipmi::responseCmdFailFwUpdMode();
-}
-
-// TBD: wait for implement
-ipmi::RspType<> psuFwAbort(uint8_t region)
-{
-    log<level::INFO>("psuFwAbort");
-    return ipmi::responseCmdFailFwUpdMode();
-}
-
-ipmi::RspType<> ipmiOemPsuFwUpdate(uint8_t region, uint8_t action,
-                                   std::string image)
-{
-    switch (action)
-    {
-        case as_int(FirmwareAction::ACTIVE):
-            return psuFwUpdate(image);
-        case as_int(FirmwareAction::STATUS):
-            return psuFwStatus(region);
-        case as_int(FirmwareAction::ABORT):
-            return psuFwAbort(region);
-        default:
-            return ipmi::responseUnspecifiedError();
-    }
-}
-
-std::string exec(const char* cmd)
-{
-    char buffer[128];
-    std::string result = "";
-    FILE* pipe = popen(cmd, "r");
-    if (!pipe)
-        throw std::runtime_error("popen() failed!");
-    try
-    {
-        while (fgets(buffer, sizeof buffer, pipe) != NULL)
-        {
-            result += buffer;
-        }
-    }
-    catch (...)
-    {
-        pclose(pipe);
-        throw;
-    }
-    pclose(pipe);
-    return result;
-}
-
 int fw_open_i2c(std::string i2c_bus)
 {
     std::string i2c_dev = I2C_DEV + i2c_bus;
@@ -182,6 +120,8 @@ static constexpr auto PSU_SERVICE = "psu_update.service";
 static constexpr auto SYSTEMD_BUSNAME = "org.freedesktop.systemd1";
 static constexpr auto SYSTEMD_PATH = "/org/freedesktop/systemd1";
 static constexpr auto SYSTEMD_INTERFACE = "org.freedesktop.systemd1.Manager";
+static constexpr auto MAX_DATA_BYTES = 240;
+static constexpr auto cmdPhase = 0x04;
 
 struct FW_INFO
 {
@@ -227,6 +167,28 @@ int read_fw_info(int i2cdev, int address, uint8_t image, std::string& ver,
     *active = info->active;
 
     return 0;
+}
+
+// TBD: wait for implement
+ipmi::RspType<uint8_t> psuFwUpdate(std::string image)
+{
+    std::string msg = "psuFwUpdate: " + image;
+    log<level::INFO>(msg.c_str());
+    return ipmi::responseCmdFailFwUpdMode();
+}
+
+// TBD: wait for implement
+ipmi::RspType<uint8_t> psuFwStatus(uint8_t region)
+{
+    log<level::INFO>("psuFwStatus");
+    return ipmi::responseCmdFailFwUpdMode();
+}
+
+// TBD: wait for implement
+ipmi::RspType<uint8_t> psuFwAbort(uint8_t region)
+{
+    log<level::INFO>("psuFwAbort");
+    return ipmi::responseCmdFailFwUpdMode();
 }
 
 int getPsuVersionInfo(ipmi::Context::ptr& ctx, std::string& ver)
@@ -290,6 +252,164 @@ void startflashPsu(sdbusplus::bus::bus& bus)
         elog<InternalFailure>();
     }
 }
+
+ipmi::RspType<uint8_t> ipmiOemPsuFwUpdate(uint8_t region, uint8_t action,
+                                          std::string image)
+{
+    switch (action)
+    {
+        case as_int(FirmwareAction::ACTIVE):
+            return psuFwUpdate(image);
+        case as_int(FirmwareAction::STATUS):
+            return psuFwStatus(region);
+        case as_int(FirmwareAction::ABORT):
+            return psuFwAbort(region);
+        default:
+            return ipmi::responseUnspecifiedError();
+    }
+}
+
+int i2c_transfer(int i2cdev, FW_CONFIG* cfg, std::vector<uint8_t>* data)
+{
+    struct i2c_rdwr_ioctl_data i2c_rdwr;
+    struct i2c_msg i2cmsg[2];
+    std::string msg;
+    uint8_t buf[MAX_DATA_BYTES];
+    int ret;
+    // set up write commands
+    std::copy(cfg->wr_cmds.begin(), cfg->wr_cmds.end(), buf);
+
+    i2cmsg[0].addr = cfg->address;
+    i2cmsg[0].flags = 0x00; // write
+    i2cmsg[0].len = cfg->wr_len;
+    i2cmsg[0].buf = buf;
+
+    i2cmsg[1].addr = cfg->address;
+    i2cmsg[1].flags = I2C_M_RD; // read
+    i2cmsg[1].len = cfg->rd_len;
+    i2cmsg[1].buf = buf;
+
+    i2c_rdwr.msgs = i2cmsg;
+    i2c_rdwr.nmsgs = 2;
+    // TODO: study ioctl return code to match spec.
+    ret = ioctl(i2cdev, I2C_RDWR, &i2c_rdwr);
+    if (ret < 0)
+    {
+        msg = "i2c transfer err, ret =" + std::to_string(ret);
+        log<level::ERR>(msg.c_str());
+        return ret;
+    }
+    if (cfg->rd_len > 0)
+    {
+        data->insert(data->end(), std::begin(buf),
+                     std::begin(buf) + cfg->rd_len);
+    }
+    return 0;
+}
+
+int set_phase(int i2cdev, uint16_t address, uint8_t phase)
+{
+    FW_CONFIG cfg = {
+        {},                          // bus
+        address,                       // address
+        1,                             // write length
+        0,                             // read length
+        std::vector<uint8_t>{cmdPhase} // write command
+    };
+    return i2c_transfer(i2cdev, &cfg, NULL);
+}
+
+int master_exec(int i2cdev, uint16_t address, std::vector<uint8_t> cmd,
+                uint8_t read_count, std::vector<uint8_t>* data)
+{
+    FW_CONFIG cfg = {
+        {},                // bus
+        address,             // address
+        (uint8_t)cmd.size(), // write length
+        read_count,          // read length
+        cmd                  // write command
+    };
+    return i2c_transfer(i2cdev, &cfg, data);
+}
+
+/**
+ * @brief Perform pmbus read/write command
+ *
+ * @param bus_id I2C bus ID
+ * @param address I2C slave address, present as 8 bits address
+ * @param phase PMBUS phase
+ * @param read_count Number of bytes to read, the maximum read count should be
+ * 240 bytes.
+ * @param data Data to write. This command should support 240 bytes of write
+ * data.
+ * @return ipmi::RspType<std::vector<uint8_t>> Bytes read from the specified
+ * slave address. This field will be absent if the read count is 0.
+ *
+ * Note: additional Completion Code: 81h = Lost Arbitration 82h = Bus Error
+ *                                   83h = NAK on Write 84h = Truncated Read
+ */
+ipmi::RspType<std::vector<uint8_t>>
+    masterPhase(uint8_t bus_id, uint8_t address, uint8_t phase,
+                uint8_t read_count, std::optional<std::vector<uint8_t>> data)
+{
+    std::vector<uint8_t> res = {};
+    int ret;
+    std::string msg = "bus:" + std::to_string(bus_id) +
+                      ",addr:" + std::to_string(address) +
+                      ",phase:" + std::to_string(phase) +
+                      ",r count:" + std::to_string(read_count);
+    log<level::INFO>(msg.c_str());
+    // check bus id
+
+    // handle address
+    if ((address & 0x1) != 0)
+    {
+        return ipmi::responseParmOutOfRange();
+    }
+    address >>= 1;
+    // check phase
+    if (phase != 0xff && phase >= 3)
+    {
+        return ipmi::responseParmOutOfRange();
+    }
+    // check read count
+    if (read_count > MAX_DATA_BYTES)
+    {
+        return ipmi::responseParmOutOfRange();
+    }
+    // check input data
+    std::vector<uint8_t> cmd = data.value_or(std::vector<uint8_t>{});
+
+    // set phase
+    int i2cdev = fw_open_i2c(std::to_string(bus_id));
+    if (i2cdev <= 0)
+    {
+        return ipmi::responseUnspecifiedError();
+    }
+    ret = set_phase(i2cdev, address, phase);
+
+    // execute command
+    if (ret == 0)
+    {
+        ret = master_exec(i2cdev, address, cmd, read_count, &res);
+    }
+
+    // set phase to 0xff
+    if (ret == 0)
+    {
+        ret = set_phase(i2cdev, address, 0xFF);
+    }
+
+    // end of process
+    close(i2cdev);
+    if (ret)
+    {
+        return ipmi::response(ret);
+    }
+
+    return ipmi::responseSuccess(res);
+}
+
 } // namespace psu
 
 namespace cpld
